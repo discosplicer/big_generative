@@ -65,8 +65,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x += self.attn(self.ln_1(x))
-        x += self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -91,7 +91,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size
         # forward the token and position embeddings
@@ -105,7 +105,10 @@ class GPT(nn.Module):
         # forward through final layer norm
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
 device = "cpu"
 if torch.cuda.is_available():
@@ -116,17 +119,37 @@ max_length = 30
 num_return_sequences = 5
 
 model = GPT(GPTConfig())
-model.eval()
 model.to(device)
 
 enc = tiktoken.get_encoding('gpt2')
 # just get the first 1000 + 256 originals
 enc._mergeable_ranks = dict(list(enc._mergeable_ranks.items())[:1256])
 enc._core_bpe = tiktoken._tiktoken.CoreBPE(enc._mergeable_ranks, enc._special_tokens, enc._pat_str) 
-tokens = enc.encode('I am a language model. ')
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
+# tokens = enc.encode('I am a language model. ')
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to(device)
+
+# Get a data batch.
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T).to(device)
+y = buf[1:].view(B, T).to(device)
+# logits, loss = model(x, y)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+import sys
+sys.exit(0)
 
 # Generation (move to fn)
 torch.manual_seed(42)
