@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from data import DataLoaderLite
+
 class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
@@ -15,6 +17,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -48,6 +51,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -71,8 +75,8 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256
-    vocab_size: int = 1256
+    block_size: int = 512
+    vocab_size: int = 2256
     n_layer: int = 6
     n_head: int = 6
     n_embd: int = 384
@@ -90,6 +94,25 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme. Token embedding uses final output weights.
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            # Scale standard deviation by inverse square root of 2*num layers.
+            # Prevents residuals increasing std.
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -110,6 +133,8 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -118,32 +143,20 @@ device_type = "cuda" if device.startswith("cuda") else "cpu"
 max_length = 30
 num_return_sequences = 5
 
+torch.set_float32_matmul_precision('high')
+
 model = GPT(GPTConfig())
 model.to(device)
 
-enc = tiktoken.get_encoding('gpt2')
-# just get the first 1000 + 256 originals
-enc._mergeable_ranks = dict(list(enc._mergeable_ranks.items())[:1256])
-enc._core_bpe = tiktoken._tiktoken.CoreBPE(enc._mergeable_ranks, enc._special_tokens, enc._pat_str) 
-# tokens = enc.encode('I am a language model. ')
-# tokens = torch.tensor(tokens, dtype=torch.long)
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-# x = tokens.to(device)
-
-# Get a data batch.
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-x = buf[:-1].view(B, T).to(device)
-y = buf[1:].view(B, T).to(device)
+train_loader = DataLoaderLite(B=16, T=model.config.block_size)
 # logits, loss = model(x, y)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+for i in range(500):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     print(f"step {i}, loss: {loss.item()}")
@@ -152,8 +165,6 @@ import sys
 sys.exit(0)
 
 # Generation (move to fn)
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     # forward model to get logits
     with torch.no_grad():
