@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import math
-import tiktoken
+import inspect
 
 import torch
 import torch.nn as nn
@@ -35,10 +35,13 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes (T, T) matrix for all queries/keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -76,7 +79,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 512
-    vocab_size: int = 2256
+    vocab_size: int = 5376
     n_layer: int = 6
     n_head: int = 6
     n_embd: int = 384
@@ -133,6 +136,25 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # Start w/ all candidate parameters.
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # Create optimizer groups. Any 2D params will be weight decayed.
+        # Generally weights decay and biases don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        # Use Fused AdamW if available.
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return optimizer
+
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 device = "cpu"
@@ -148,18 +170,39 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig())
 model.to(device)
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+max_steps = 500
+warmup_steps = 10
+def get_lr(it):
+    # 1. Linear warmup.
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2. If it > lr_decay_iters, return min learning rate.
+    if it > max_steps:
+        return min_lr
+    # 3. In between, use cosine decay down to min learning rate.
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # starts at 1, goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
 train_loader = DataLoaderLite(B=16, T=model.config.block_size)
 # logits, loss = model(x, y)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(500):
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+for step in range(max_steps):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    print(f"step {step}, loss: {loss.item():.6f}, norm: {norm:.4f}")
 
 import sys
 sys.exit(0)

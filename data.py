@@ -9,8 +9,8 @@ class DataLoaderLite:
         with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
-        # just get the first 1000 + 256 originals
-        enc._mergeable_ranks = dict(list(enc._mergeable_ranks.items())[:1256])
+        # just get the first 5000 + 256 originals (go up a bit to avoid "ugly numbers")
+        enc._mergeable_ranks = dict(list(enc._mergeable_ranks.items())[:5376])
         enc._core_bpe = tiktoken._tiktoken.CoreBPE(enc._mergeable_ranks, enc._special_tokens, enc._pat_str) 
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
