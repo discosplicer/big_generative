@@ -162,8 +162,6 @@ if torch.cuda.is_available():
     device = "cuda"
 print("using device: ", device)
 device_type = "cuda" if device.startswith("cuda") else "cpu"
-max_length = 30
-num_return_sequences = 5
 
 torch.set_float32_matmul_precision('high')
 
@@ -187,47 +185,74 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # starts at 1, goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
-train_loader = DataLoaderLite(B=16, T=model.config.block_size)
+
+total_batch_size = 49152
+B = 16 # micro batch
+T = model.config.block_size
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calc grad accum steps: {grad_accum_steps}")
+train_loader = DataLoaderLite(B=B, T=T)
+
+
+
 # logits, loss = model(x, y)
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 for step in range(max_steps):
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+    model.train()
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps  # Normalize the loss.
+        loss_accum += loss.detach()
+        loss.backward()
+    
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    print(f"step {step}, loss: {loss.item():.6f}, norm: {norm:.4f}")
+    print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
 
-import sys
-sys.exit(0)
+    # once in a while generate from the model (except step 0, which is noise)
+    if (step > 0 and step % 10 == 0) or (step == max_steps - 1):
+        model.eval()
+        num_return_sequences = 1
+        max_length = 128
+        tokens = train_loader.enc.encode("MATT: “Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 10
+                topk_probs, topk_indices = torch.topk(probs, 10, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = train_loader.enc.decode(tokens)
+            print(f"sample {i}: {decoded}")
 
-# Generation (move to fn)
-while x.size(1) < max_length:
-    # forward model to get logits
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        # take logits at last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 10
-        # topk_probs is now (5, 10)
-        topk_probs, topk_indices = torch.topk(probs, 10, dim=-1)
-        # select token from top-k
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to seq
-        x = torch.cat((x, xcol), dim=1)
 
-# print generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)

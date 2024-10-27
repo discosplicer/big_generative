@@ -6,13 +6,13 @@ class DataLoaderLite:
         self.B = B
         self.T = T
         # at init load tokens from disk
-        with open('input.txt', 'r') as f:
+        with open('littycritty.txt', 'r', encoding='UTF-8') as f:
             text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
+        self.enc = tiktoken.get_encoding('gpt2')
         # just get the first 5000 + 256 originals (go up a bit to avoid "ugly numbers")
-        enc._mergeable_ranks = dict(list(enc._mergeable_ranks.items())[:5376])
-        enc._core_bpe = tiktoken._tiktoken.CoreBPE(enc._mergeable_ranks, enc._special_tokens, enc._pat_str) 
-        tokens = enc.encode(text)
+        self.enc._mergeable_ranks = dict(list(self.enc._mergeable_ranks.items())[:5376])
+        self.enc._core_bpe = tiktoken._tiktoken.CoreBPE(self.enc._mergeable_ranks, self.enc._special_tokens, self.enc._pat_str) 
+        tokens = self.enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
