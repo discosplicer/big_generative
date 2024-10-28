@@ -79,7 +79,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 512
-    vocab_size: int = 5376
+    vocab_size: int = 10257  # number of tokens: 10,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 6
     n_head: int = 6
     n_embd: int = 384
@@ -170,8 +170,8 @@ model.to(device)
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-max_steps = 500
-warmup_steps = 10
+max_steps = 5000
+warmup_steps = 50
 def get_lr(it):
     # 1. Linear warmup.
     if it < warmup_steps:
@@ -221,11 +221,11 @@ for step in range(max_steps):
     print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
 
     # once in a while generate from the model (except step 0, which is noise)
-    if (step > 0 and step % 10 == 0) or (step == max_steps - 1):
+    if (step > 0 and step % 50 == 0) or (step == max_steps - 1):
         model.eval()
         num_return_sequences = 1
         max_length = 128
-        tokens = train_loader.enc.encode("MATT: “Hello, I'm a language model,")
+        tokens = train_loader.enc.encode("In this paper we aim to show the effect that non-human intelligence (NHI) has had in guiding the development, and later stagnation, of scientific progress.")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -240,8 +240,8 @@ for step in range(max_steps):
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
                 probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 10
-                topk_probs, topk_indices = torch.topk(probs, 10, dim=-1)
+                # do top-k sampling of 25
+                topk_probs, topk_indices = torch.topk(probs, 25, dim=-1)
                 # select a token from the top-k probabilities
                 # note: multinomial does not demand the input to sum to 1
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
