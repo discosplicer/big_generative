@@ -220,12 +220,13 @@ for step in range(max_steps):
     optimizer.step()
     print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
 
+    cutoffs = torch.zeros(1, dtype=torch.bfloat16).to(device)
     # once in a while generate from the model (except step 0, which is noise)
     if (step > 0 and step % 50 == 0) or (step == max_steps - 1):
         model.eval()
-        num_return_sequences = 1
+        num_return_sequences = 5
         max_length = 128
-        tokens = train_loader.enc.encode("In this paper we aim to show the effect that non-human intelligence (NHI) has had in guiding the development, and later stagnation, of scientific progress.")
+        tokens = train_loader.enc.encode("Here is the truth about UFOs:")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -238,17 +239,21 @@ for step in range(max_steps):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
+                # do top-k sampling of 25 tokens on average, but sometimes more or less
+                topk_logits, _ = torch.topk(logits, 25, dim=-1)
+                # make sure to sample from at least 3
+                top3_logits, _ = torch.topk(logits, 3, dim=-1)
+                # append the min logit to the list of cutoff logits
+                cutoffs = torch.cat((cutoffs, topk_logits.min().reshape(1)))
+                # take the average of all cutoff probabilities
+                cutoff = torch.minimum(cutoffs.mean(), top3_logits.min().reshape(1))
+                # don't sample logits below the cutoff
+                logits[logits < cutoff] = -float('Inf')
                 # get the probabilities
                 probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 25
-                topk_probs, topk_indices = torch.topk(probs, 25, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                # gather the corresponding indices
-                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                idx_next = torch.multinomial(probs, num_samples=1)
                 # append to the sequence
-                xgen = torch.cat((xgen, xcol), dim=1)
+                xgen = torch.cat((xgen, idx_next), dim=1)
         # print the generated text
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()

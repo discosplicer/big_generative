@@ -40,7 +40,7 @@ def write_datafile(filename, tokens_np):
 if __name__ == '__main__':
     local_dir = "fineweb1B"
     remote_name = "sample-10BT"
-    shard_size = int(1e5) # 100K tokens per shard
+    shard_size = int(1e3) # 1K documents per shard
 
     # create the cache the local directory if it doesn't exist yet
     DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
