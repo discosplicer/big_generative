@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import math
 import inspect
+import numpy as np
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -168,7 +170,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig())
 model.to(device)
 
-max_lr = 6e-4
+max_lr = 1e-3
 min_lr = max_lr * 0.1
 max_steps = 5000
 warmup_steps = 50
@@ -219,14 +221,12 @@ for step in range(max_steps):
         param_group['lr'] = lr
     optimizer.step()
     print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
-
-    cutoffs = torch.zeros(1, dtype=torch.bfloat16).to(device)
     # once in a while generate from the model (except step 0, which is noise)
-    if (step > 0 and step % 50 == 0) or (step == max_steps - 1):
+    if (step > 0 and step % 100 == 0) or (step == max_steps - 1):
         model.eval()
-        num_return_sequences = 5
-        max_length = 128
-        tokens = train_loader.enc.encode("Here is the truth about UFOs:")
+        num_return_sequences = 1
+        max_length = 512
+        tokens = train_loader.enc.encode("The truth about UFOs is that")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -239,19 +239,31 @@ for step in range(max_steps):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
-                # do top-k sampling of 25 tokens on average, but sometimes more or less
-                topk_logits, _ = torch.topk(logits, 25, dim=-1)
-                # make sure to sample from at least 3
-                top3_logits, _ = torch.topk(logits, 3, dim=-1)
-                # append the min logit to the list of cutoff logits
-                cutoffs = torch.cat((cutoffs, topk_logits.min().reshape(1)))
-                # take the average of all cutoff probabilities
-                cutoff = torch.minimum(cutoffs.mean(), top3_logits.min().reshape(1))
-                # don't sample logits below the cutoff
-                logits[logits < cutoff] = -float('Inf')
-                # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+                log_probs = F.log_softmax(logits, dim=-1)
+                cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, axis=-1)
+                if cross_entropy[0] < 0.8:
+                    idx_next = torch.argmax(logits, axis=-1, keepdims=True)
+                elif cross_entropy[0] < 1.7:
+                    logits = logits / 0.7
+                    topk_logits, _ = torch.topk(logits, 25, dim=-1)
+                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                    # get the probabilities
+                    probs = F.softmax(logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                elif cross_entropy[0] < 2.5:
+                    logits = logits / 0.9
+                    topk_logits, _ = torch.topk(logits, 40, dim=-1)
+                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                    # get the probabilities
+                    probs = F.softmax(logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                else:
+                    logits = logits / 1.1
+                    topk_logits, _ = torch.topk(logits, 100, dim=-1)
+                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                    # get the probabilities
+                    probs = F.softmax(logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1)
                 # append to the sequence
                 xgen = torch.cat((xgen, idx_next), dim=1)
         # print the generated text

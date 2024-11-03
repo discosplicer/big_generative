@@ -21,7 +21,7 @@ class DataLoaderLite:
         self.reload()
     
     def reload(self):
-        dataset = load_dataset("HuggingFaceFW/fineweb", name="sample-350BT", split="train", streaming=True)
+        dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-350BT", split="train", streaming=True)
         fw = dataset.shuffle(buffer_size=1000).take(10000)
 
         self.enc = tiktoken.get_encoding('gpt2')
