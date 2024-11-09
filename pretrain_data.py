@@ -3,6 +3,16 @@ import torch
 import numpy as np
 from datasets import load_dataset
 
+def tokenize(enc, doc):
+    eot = enc._special_tokens['<|endoftext|>'] # end of text token
+    # tokenizes a single document and returns a numpy array of uint16 tokens
+    tokens = [eot] # the special <|endoftext|> token delimits all documents
+    tokens.extend(enc.encode_ordinary(doc["text"]))
+    tokens_np = np.array(tokens)
+    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+    tokens_np_uint16 = tokens_np.astype(np.uint16)
+    return tokens_np_uint16
+
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
@@ -11,8 +21,8 @@ class DataLoaderLite:
         self.reload()
     
     def reload(self):
-        with open('littycritty.txt', 'r', encoding='utf-8') as f:
-            dataset = f.read()
+        dataset = load_dataset("HuggingFaceFW/fineweb", name="sample-350BT", split="train", streaming=True)
+        fw = dataset.shuffle(buffer_size=1000).take(10000)
 
         self.enc = tiktoken.get_encoding('gpt2')
         # just get the first 10000 + 256 originals
@@ -21,7 +31,12 @@ class DataLoaderLite:
         self.enc._core_bpe = tiktoken._tiktoken.CoreBPE(self.enc._mergeable_ranks, self.enc._special_tokens, self.enc._pat_str) 
         eot = self.enc._special_tokens['<|endoftext|>'] # end of text token
         tokens = [eot] # the special <|endoftext|> token delimits all documents
-        tokens.extend(self.enc.encode_ordinary(dataset))
+        for doc in fw:
+            # most of the low quality stuff has email, website, etc.
+            # but might need to add it back for some cases?
+            if 'email' not in doc["text"] and 'website' not in doc['text']:
+                # tokenizes a single document and returns a numpy array of uint16 tokens
+                tokens.extend(self.enc.encode_ordinary(doc["text"]))
         # tokens_np = np.array(tokens)
         # assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
         # tokens_np_uint16 = tokens_np.astype(np.uint16)
@@ -41,5 +56,5 @@ class DataLoaderLite:
         self.current_position += B * T
         # if loading the next batch would be out of bounds, reset.
         if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+            self.reload()
         return x, y
