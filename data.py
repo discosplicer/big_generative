@@ -7,11 +7,12 @@ class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
         self.T = T
+        self.cycles = 0
 
         self.reload()
     
     def reload(self):
-        with open('littycritty.txt', 'r', encoding='utf-8') as f:
+        with open('bge.txt', 'r', encoding='utf-8') as f:
             dataset = f.read()
 
         self.enc = tiktoken.get_encoding('gpt2')
@@ -42,4 +43,5 @@ class DataLoaderLite:
         # if loading the next batch would be out of bounds, reset.
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_position = 0
+            self.cycles += 1
         return x, y

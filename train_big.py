@@ -83,9 +83,9 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 512
     vocab_size: int = 10257  # number of tokens: 10,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
 
 class GPT(nn.Module):
 
@@ -179,8 +179,10 @@ grad_accum_steps = total_batch_size // (B * T)
 print(f"total desired batch size: {total_batch_size}")
 print(f"=> calc grad accum steps: {grad_accum_steps}")
 
-max_steps = 5000
-warmup_steps = 100
+max_steps = 250
+warmup_steps = 25
+max_lr = 6e-4
+min_lr = max_lr * 0.1
 def get_lr(it):
     # 1. Linear warmup.
     if it < warmup_steps:
@@ -195,160 +197,166 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 
+def pretrain(data, quantile):
+    train_loader = PreLoader(B=B, T=T, model=model, quantile=quantile, data=data)
+    # logits, loss = model(x, y)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+    for step in range(max_steps):
+        model.train()
+        optimizer.zero_grad()
+        loss_accum = 0.0
 
-train_loader = PreLoader(B=B, T=T)
-max_lr = 1e-3
-min_lr = max_lr * 0.3
-# logits, loss = model(x, y)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
-step = 0
-loss_accum = 10.0
-while step < max_steps or loss_accum > 3.5:
-    step += 1
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps  # Normalize the loss.
-        loss_accum += loss.detach()
-        loss.backward()
-    
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
-    # once in a while generate from the model (except step 0, which is noise)
-    if (step > 0 and step % 100 == 0) or (step == max_steps - 1):
-        model.eval()
-        num_return_sequences = 1
-        max_length = 512
-        tokens = train_loader.enc.encode("However,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                log_probs = F.log_softmax(logits, dim=-1)
-                cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, axis=-1)
-                if cross_entropy[0] < 0.8:
-                    idx_next = torch.argmax(logits, axis=-1, keepdims=True)
-                elif cross_entropy[0] < 1.7:
-                    logits = logits / 0.7
-                    topk_logits, _ = torch.topk(logits, 25, dim=-1)
-                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                elif cross_entropy[0] < 2.5:
-                    logits = logits / 0.9
-                    topk_logits, _ = torch.topk(logits, 40, dim=-1)
-                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                else:
-                    logits = logits / 1.1
-                    topk_logits, _ = torch.topk(logits, 100, dim=-1)
-                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                # append to the sequence
-                xgen = torch.cat((xgen, idx_next), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = train_loader.enc.decode(tokens)
-            print(f"sample {i}: {decoded}")
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accum_steps  # Normalize the loss.
+            loss_accum += loss.detach()
+            loss.backward()
+        
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
+        # once in a while generate from the model (except step 0, which is noise)
+        if (step > 0 and step % 50 == 0) or (step == max_steps - 1):
+            model.eval()
+            num_return_sequences = 1
+            max_length = 512
+            tokens = train_loader.enc.encode("However,")
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42)
+            while xgen.size(1) < max_length:
+                # forward the model to get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(xgen) # (B, T, vocab_size)
+                    # take the logits at the last position
+                    logits = logits[:, -1, :] # (B, vocab_size)
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, axis=-1)
+                    if cross_entropy[0] < 0.8:
+                        idx_next = torch.argmax(logits, axis=-1, keepdims=True)
+                    elif cross_entropy[0] < 1.7:
+                        logits = logits / 0.7
+                        topk_logits, _ = torch.topk(logits, 25, dim=-1)
+                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                    elif cross_entropy[0] < 2.5:
+                        logits = logits / 0.9
+                        topk_logits, _ = torch.topk(logits, 40, dim=-1)
+                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                    else:
+                        logits = logits / 1.1
+                        topk_logits, _ = torch.topk(logits, 100, dim=-1)
+                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                    # append to the sequence
+                    xgen = torch.cat((xgen, idx_next), dim=1)
+            # print the generated text
+            for i in range(num_return_sequences):
+                tokens = xgen[i, :max_length].tolist()
+                decoded = train_loader.enc.decode(tokens)
+                print(f"sample {i}: {decoded}")
 
 # finetuning
-train_loader = DataLoaderLite(B=B, T=T)
-max_steps = 1000
-max_lr = 3e-4
-min_lr = max_lr * 0.05
-# logits, loss = model(x, y)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
-for step in range(max_steps):
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
+def finetune():
+    train_loader = DataLoaderLite(B=B, T=T)
+    # logits, loss = model(x, y)
+    optimizer = model.configure_optimizers(weight_decay=0.5, learning_rate=max_lr, device=device)
+    for step in range(max_steps):
+        model.train()
+        optimizer.zero_grad()
+        loss_accum = 0.0
 
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps  # Normalize the loss.
-        loss_accum += loss.detach()
-        loss.backward()
-    
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
-    # once in a while generate from the model (except step 0, which is noise)
-    if (step > 0 and step % 50 == 0) or (step == max_steps - 1):
-        model.eval()
-        num_return_sequences = 1
-        max_length = 512
-        tokens = train_loader.enc.encode("MATT:")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                log_probs = F.log_softmax(logits, dim=-1)
-                cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, axis=-1)
-                if cross_entropy[0] < 0.8:
-                    idx_next = torch.argmax(logits, axis=-1, keepdims=True)
-                elif cross_entropy[0] < 1.7:
-                    logits = logits / 0.7
-                    topk_logits, _ = torch.topk(logits, 25, dim=-1)
-                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                elif cross_entropy[0] < 2.5:
-                    logits = logits / 0.9
-                    topk_logits, _ = torch.topk(logits, 40, dim=-1)
-                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                else:
-                    logits = logits / 1.1
-                    topk_logits, _ = torch.topk(logits, 100, dim=-1)
-                    logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                # append to the sequence
-                xgen = torch.cat((xgen, idx_next), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = train_loader.enc.decode(tokens)
-            print(f"sample {i}: {decoded}")
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accum_steps  # Normalize the loss.
+            loss_accum += loss.detach()
+            loss.backward()
+        
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
+        # once in a while generate from the model (except step 0, which is noise)
+        if (step > 0 and step % 50 == 0) or (step == max_steps - 1):
+            model.eval()
+            num_return_sequences = 1
+            max_length = 512
+            tokens = train_loader.enc.encode("I have never said that")
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42)
+            while xgen.size(1) < max_length:
+                # forward the model to get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(xgen) # (B, T, vocab_size)
+                    # take the logits at the last position
+                    logits = logits[:, -1, :] # (B, vocab_size)
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, axis=-1)
+                    if cross_entropy[0] < 0.8:
+                        idx_next = torch.argmax(logits, axis=-1, keepdims=True)
+                    elif cross_entropy[0] < 1.7:
+                        logits = logits / 0.7
+                        topk_logits, _ = torch.topk(logits, 25, dim=-1)
+                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                    elif cross_entropy[0] < 2.5:
+                        logits = logits / 0.9
+                        topk_logits, _ = torch.topk(logits, 40, dim=-1)
+                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                    else:
+                        logits = logits / 1.1
+                        topk_logits, _ = torch.topk(logits, 100, dim=-1)
+                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                    # append to the sequence
+                    xgen = torch.cat((xgen, idx_next), dim=1)
+            # print the generated text
+            for i in range(num_return_sequences):
+                tokens = xgen[i, :max_length].tolist()
+                decoded = train_loader.enc.decode(tokens)
+                print(f"sample {i}: {decoded}")
+
+def switchback():
+    for i in range(10):
+        quantile = 0.5 - i / 20.0
+        pretrain(data='fineweb-edu', quantile=quantile)
+        finetune()
+
+def specialize():
+    for i in range(20):
+        quantile = 0.5 - i / 40.0
+        pretrain(data='fineweb-edu', quantile=quantile)
+
+switchback()
