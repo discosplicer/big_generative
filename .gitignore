@@ -3,5 +3,5 @@
 *.py[cod]
 
 *.pt
+*.txt
 .vscode/
-notes.txt
