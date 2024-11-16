@@ -50,7 +50,7 @@ class DataLoaderLite:
             doc_tokens = self.enc.encode_ordinary(doc["text"])
             dt.append(doc_tokens)
             torch_tokens = torch.tensor(doc_tokens, dtype=torch.long)
-            if (self.T + 1) > len(doc_tokens):
+            if (self.T + 2) > len(doc_tokens):
                 # short document, don't bother
                 dl.extend([100.0])
             else:
