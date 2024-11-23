@@ -19,22 +19,22 @@ def tokenize(enc, doc):
     return tokens_np_uint16
 
 class DataLoaderLite:
-    def __init__(self, B, T, model, quantile, data='fineweb'):
+    def __init__(self, B, T, model, quantile, data='fineweb', skip=0):
         self.B = B
         self.T = T
         self.model = model
         self.quantile = quantile
         self.data = data
+        self.skip = skip
+        self.dataset = load_dataset(f"HuggingFaceFW/{self.data}", name="sample-350BT", split="train", streaming=True)
 
         
 
         self.reload()
     
     def reload(self):
-        dataset = load_dataset(f"HuggingFaceFW/{self.data}", name="sample-350BT", split="train", streaming=True)
-        fw = dataset.shuffle(buffer_size=1000).take(10000)
-
-        self.cycle_trigger = False
+        fw = self.dataset.skip(self.skip).take(10000)
+        self.skip += 10000
 
         self.enc = tiktoken.get_encoding('gpt2')
         # just get the first 10000 + 256 originals

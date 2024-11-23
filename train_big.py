@@ -179,9 +179,9 @@ grad_accum_steps = total_batch_size // (B * T)
 print(f"total desired batch size: {total_batch_size}")
 print(f"=> calc grad accum steps: {grad_accum_steps}")
 
-max_steps = 50
+max_steps = 100
 warmup_steps = 10
-max_lr = 3e-4
+max_lr = 6e-4
 min_lr = max_lr * 0.1
 def get_lr(it):
     # 1. Linear warmup.
@@ -197,8 +197,8 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def pretrain(data, quantile):
-    train_loader = PreLoader(B=B, T=T, model=model, quantile=quantile, data=data)
+def pretrain(data, quantile, skip=0):
+    train_loader = PreLoader(B=B, T=T, model=model, quantile=quantile, data=data, skip=skip)
     # logits, loss = model(x, y)
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
     for step in range(max_steps):
@@ -275,23 +275,23 @@ def pretrain(data, quantile):
                 tokens = xgen[i, :max_length].tolist()
                 decoded = train_loader.enc.decode(tokens)
                 print(f"sample {i}: {decoded}")
-    return loss_accum.item()
+    return loss_accum.item(), train_loader.skip
 
 # finetuning
 def finetune():
-    train_loader = DataLoaderLite(B=B, T=T)
+    fine_loader = DataLoaderLite(B=B, T=T)
     # logits, loss = model(x, y)
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=1e-4, device=device)
     max_cycles = 10
     step = 0
-    while train_loader.cycles < max_cycles or step < 50:
+    while fine_loader.cycles < max_cycles or step < 50:
         step += 1
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
 
         for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch()
+            x, y = fine_loader.next_batch()
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
@@ -309,7 +309,7 @@ def finetune():
             model.eval()
             num_return_sequences = 1
             max_length = 512
-            tokens = train_loader.enc.encode("I have never said that")
+            tokens = fine_loader.enc.encode("I have never said that")
             tokens = torch.tensor(tokens, dtype=torch.long)
             tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
             xgen = tokens.to(device)
@@ -351,21 +351,25 @@ def finetune():
             # print the generated text
             for i in range(num_return_sequences):
                 tokens = xgen[i, :max_length].tolist()
-                decoded = train_loader.enc.decode(tokens)
+                decoded = fine_loader.enc.decode(tokens)
                 print(f"sample {i}: {decoded}")
 
 def switchback():
     pretrain_loss = 10.0
+    skip = 0
     while pretrain_loss > 3.5:
         quantile = (pretrain_loss / 10.0)**2
-        pretrain_loss = pretrain(data='fineweb', quantile=quantile)
+        pretrain_loss, skip = pretrain(data='fineweb', quantile=quantile, skip=skip)
+        print(f"skip: {skip}")
         finetune()
 
 
 def specialize():
     pretrain_loss = 10.0
+    skip = 0
     while pretrain_loss > 3.5:
         quantile = (pretrain_loss / 10.0)**2
-        pretrain_loss = pretrain(data='fineweb-edu', quantile=quantile)
+        pretrain_loss, skip = pretrain(data='fineweb-edu', quantile=quantile, skip=skip)
+        print(f"skip: {skip}")
 
-switchback()
+specialize()
