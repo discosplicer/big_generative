@@ -96,6 +96,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(0.5),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -127,7 +128,7 @@ class GPT(nn.Module):
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings (B, T, n_embd)
-        x = tok_emb + pos_emb
+        x = tok_emb + self.transformer.drop(pos_emb)
         # forward through transformer blocks
         for block in self.transformer.h:
             x = block(x)
@@ -225,7 +226,7 @@ def pretrain(data, quantile, skip=0):
         if (step == max_steps - 1):
             model.eval()
             num_return_sequences = 1
-            max_length = 512
+            max_length = 1024
             tokens = train_loader.enc.encode("However,")
             tokens = torch.tensor(tokens, dtype=torch.long)
             tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -235,35 +236,32 @@ def pretrain(data, quantile, skip=0):
             while xgen.size(1) < max_length:
                 # forward the model to get the logits
                 with torch.no_grad():
+                    # if the sequence context is growing too long we must crop it at block_size
+                    xgen_cond = xgen[:, -T :]
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(xgen) # (B, T, vocab_size)
+                        logits, loss = model(xgen_cond) # (B, T, vocab_size)
                     # take the logits at the last position
                     logits = logits[:, -1, :] # (B, vocab_size)
                     log_probs = F.log_softmax(logits, dim=-1)
                     cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, axis=-1)
                     if cross_entropy[0] < 0.8:
-                        logits = logits / 0.7
-                        topk_logits, _ = torch.topk(logits, 5, dim=-1)
-                        logits[logits < topk_logits[:, [-1]]] = -float('Inf')
-                        # get the probabilities
-                        probs = F.softmax(logits, dim=-1)
-                        idx_next = torch.multinomial(probs, num_samples=1)
+                        idx_next = torch.argmax(logits, axis=-1, keepdims=True)
                     elif cross_entropy[0] < 1.7:
-                        logits = logits / 0.8
-                        topk_logits, _ = torch.topk(logits, 10, dim=-1)
+                        logits = logits / 0.7
+                        topk_logits, _ = torch.topk(logits, 25, dim=-1)
                         logits[logits < topk_logits[:, [-1]]] = -float('Inf')
                         # get the probabilities
                         probs = F.softmax(logits, dim=-1)
                         idx_next = torch.multinomial(probs, num_samples=1)
                     elif cross_entropy[0] < 2.5:
-                        logits = logits / 0.9
-                        topk_logits, _ = torch.topk(logits, 20, dim=-1)
+                        logits = logits / 0.85
+                        topk_logits, _ = torch.topk(logits, 40, dim=-1)
                         logits[logits < topk_logits[:, [-1]]] = -float('Inf')
                         # get the probabilities
                         probs = F.softmax(logits, dim=-1)
                         idx_next = torch.multinomial(probs, num_samples=1)
                     else:
-                        topk_logits, _ = torch.topk(logits, 40, dim=-1)
+                        topk_logits, _ = torch.topk(logits, 100, dim=-1)
                         logits[logits < topk_logits[:, [-1]]] = -float('Inf')
                         # get the probabilities
                         probs = F.softmax(logits, dim=-1)
@@ -282,9 +280,10 @@ def finetune():
     fine_loader = DataLoaderLite(B=B, T=T)
     # logits, loss = model(x, y)
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=1e-4, device=device)
-    max_cycles = 10
+    # max_cycles = 10
+    norm = 0
     step = 0
-    while fine_loader.cycles < max_cycles or step < 50:
+    while norm < 1 or step < 25:
         step += 1
         model.train()
         optimizer.zero_grad()
@@ -305,10 +304,10 @@ def finetune():
         optimizer.step()
         print(f"step {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}")
         # once in a while generate from the model (except step 0, which is noise)
-        if (step > 0 and step % 50 == 0):
+        if (step > 25 and step % 10 == 0):
             model.eval()
             num_return_sequences = 1
-            max_length = 512
+            max_length = 1024
             tokens = fine_loader.enc.encode("I have never said that")
             tokens = torch.tensor(tokens, dtype=torch.long)
             tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -318,8 +317,10 @@ def finetune():
             while xgen.size(1) < max_length:
                 # forward the model to get the logits
                 with torch.no_grad():
+                    # if the sequence context is growing too long we must crop it at block_size
+                    xgen_cond = xgen[:, -T :]
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(xgen) # (B, T, vocab_size)
+                        logits, loss = model(xgen_cond) # (B, T, vocab_size)
                     # take the logits at the last position
                     logits = logits[:, -1, :] # (B, vocab_size)
                     log_probs = F.log_softmax(logits, dim=-1)
@@ -372,4 +373,4 @@ def specialize():
         pretrain_loss, skip = pretrain(data='fineweb-edu', quantile=quantile, skip=skip)
         print(f"skip: {skip}")
 
-specialize()
+switchback()

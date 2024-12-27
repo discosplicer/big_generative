@@ -12,7 +12,7 @@ class DataLoaderLite:
         self.reload()
     
     def reload(self):
-        with open('dusk.txt', 'r', encoding='utf-8') as f:
+        with open('littycritty.txt', 'r', encoding='utf-8') as f:
             dataset = f.read()
 
         self.enc = tiktoken.get_encoding('gpt2')
